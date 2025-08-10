@@ -26,7 +26,7 @@ from rank_bm25 import BM25Okapi
 from rank_bm25 import BM25Okapi
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.retrievers.document_compressors import DocumentCompressorPipeline
-from langchain.retrievers import ContextualCompressionRetriever, BM25Retriever
+from langchain_community.retrievers import BM25Retriever
 from langchain.schema import Document
 from langchain_community.document_transformers import LongContextReorder
 
