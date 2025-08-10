@@ -32,7 +32,7 @@ from langchain_community.document_transformers import LongContextReorder
 
 # --- 2. Configuration & API Keys ---
 
-AUTH_TOKEN = os.environ.get("HACKRX_AUTH_TOKEN", "b7be0d0c6cb51a6c84e190a66d4542526361d32d3df9035b4c8a00b9198df85")
+AUTH_TOKEN = os.environ.get("HACKRX_AUTH_TOKEN", "b7be0d0c6cb51a6c84e190a66d4542526361d32d3df9035b4c8a00b9198df385")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyAaaQ1eLAGq3VckCBBF4YCLKaIxWPVZnSg")
 
 if not GOOGLE_API_KEY or GOOGLE_API_KEY == "YOUR_GOOGLE_API_KEY_HERE":
