@@ -33,9 +33,9 @@ AUTH_TOKEN = os.environ.get("HACKRX_AUTH_TOKEN", "b7be0d0c6cb51a6c84e190a66d4542
 # --- NEW: List of API Keys for Rotation ---
 # Add your API keys to this list. It will cycle through them for each request.
 GOOGLE_API_KEYS = [
-    os.environ.get("GOOGLE_API_KEY_1", "AIzaSyAaaQ1eLAGq3VckCBBF4YCLKaIxWPVZnSg"),
-    os.environ.get("GOOGLE_API_KEY_2", "YOUR_GOOGLE_API_KEY_2_HERE"),
-    os.environ.get("GOOGLE_API_KEY_3", "YOUR_GOOGLE_API_KEY_3_HERE"),
+    os.environ.get("GOOGLE_API_KEY_1", "AIzaSyCpci8OJlkTtWAwt99_3wLETP5yIuBsn6E"),
+    os.environ.get("GOOGLE_API_KEY_2", "AIzaSyDwV1kqdmc7-FkhaqBqLQfjI-f__Y8Rc3E"),
+    os.environ.get("GOOGLE_API_KEY_3", "AIzaSyAag-9G6_aOc6RsxxfEBGZ1WL4gvJcGAGo"),
 ]
 
 # Filter out placeholder keys
