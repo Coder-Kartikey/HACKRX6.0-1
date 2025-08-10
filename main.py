@@ -1,28 +1,39 @@
-# Application for the HackRx 6.0 Challenge
-# VERSION 3: Using Google Gemini API for high-quality answers.
+# main.py
+# Complete FastAPI application for the HackRx 6.0 Challenge
+# VERSION 5.0: Production-Grade RAG with Hybrid Search and LLM Re-ranking for Maximum Accuracy.
 
 # --- 1. Imports ---
 import os
 import time
+import asyncio
 import requests
-import fitz  
+import fitz  # PyMuPDF
 import numpy as np
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Dict
 from fastapi.middleware.cors import CORSMiddleware
 
 
 # --- Imports for Google Gemini ---
 import google.generativeai as genai
 
+# --- NEW: Import for Keyword Search ---
+from rank_bm25 import BM25Okapi
+
+# --- Imports for LangChain and Keyword Search ---
+from rank_bm25 import BM25Okapi
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.retrievers.document_compressors import DocumentCompressorPipeline
+from langchain.retrievers import ContextualCompressionRetriever, BM25Retriever
+from langchain.schema import Document
+from langchain_community.document_transformers import LongContextReorder
+
 # --- 2. Configuration & API Keys ---
 
-AUTH_TOKEN = os.environ.get("HACKRX_AUTH_TOKEN", "b7be0d0c6cb51a6c84e190a66d4542526361d32d3df9035b4c8a00b9198df385")
-
-# --- Configure Gemini API Key ---
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyACG4pGMiV1APn0CXTfGxIduUzSmFiY3hc")
+AUTH_TOKEN = os.environ.get("HACKRX_AUTH_TOKEN", "b7be0d0c6cb51a6c84e190a66d4542526361d32d3df9035b4c8a00b9198df85")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyAc8XdIU9KveO9ER0xtWZVyaXmAMZf6jOI")
 
 if not GOOGLE_API_KEY or GOOGLE_API_KEY == "YOUR_GOOGLE_API_KEY_HERE":
     print("WARNING: GOOGLE_API_KEY is not set. The application will not work.")
@@ -30,12 +41,11 @@ else:
     genai.configure(api_key=GOOGLE_API_KEY)
     print("Google Gemini API configured.")
 
-
 # --- 3. FastAPI App Initialization ---
 app = FastAPI(
-    title="HackRx 6.0 LLM Document Processing System (Google Gemini)",
-    description="An API to process documents and answer questions using the Gemini API.",
-    version="3.2.0"
+    title="HackRx 6.0 Production-Grade RAG System",
+    description="An API using Hybrid Search and LLM Re-ranking for maximum accuracy.",
+    version="5.0.0"
 )
 
 # CORS Middleware for local development
@@ -57,166 +67,177 @@ class AnswerResponse(BaseModel):
 
 # --- 5. Security ---
 security = HTTPBearer()
-
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if credentials.scheme != "Bearer" or credentials.credentials != AUTH_TOKEN:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
     return credentials.credentials
 
 # --- 6. Core RAG Pipeline Components ---
+
 class RAGPipeline:
     def __init__(self):
         self.text_chunks = []
         self.vector_store = None
-        # Initialize the generative model once
+        self.keyword_retriever = None
         self.generative_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        self.generation_config = genai.types.GenerationConfig(max_output_tokens=500, temperature=0.0)
+        self.safety_settings = [
+            {"category": c, "threshold": "BLOCK_NONE"} for c in 
+            ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", 
+             "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]
+        ]
 
-    def _download_and_extract_text(self, pdf_url: str) -> str:
+    # --- Document Loading and Chunking ---
+    def load_and_chunk_document(self, pdf_url: str):
+        print("Step 1.1: Downloading and extracting text...")
         try:
-            response = requests.get(pdf_url, timeout=20)
+            response = requests.get(pdf_url, timeout=30)
             response.raise_for_status()
             pdf_bytes = response.content
-            text = ""
+            full_text = ""
             with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
                 for page in doc:
-                    text += page.get_text()
-            return text
-        except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=400, detail=f"Failed to download document: {e}")
+                    full_text += page.get_text()
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to process PDF: {e}")
 
-    def _split_text_into_chunks(self, text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
-        if not text:
-            return []
-        chunks = []
-        start = 0
-        while start < len(text):
-            end = start + chunk_size
-            chunks.append(text[start:end])
-            start += chunk_size - overlap
-        self.text_chunks = chunks
-        return chunks
+        print("Step 1.2: Performing Recursive Chunking...")
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200, length_function=len
+        )
+        self.text_chunks = text_splitter.split_text(full_text)
+        print(f"  - Document split into {len(self.text_chunks)} chunks.")
 
-    def _get_embeddings(self, texts: List[str], task_type: str) -> np.ndarray:
-        # --- MODIFIED: Implemented batch processing to prevent timeouts ---
-        all_embeddings = []
-        # Process the texts in batches of 32 (a safe number for the API)
-        for i in range(0, len(texts), 32):
-            batch = texts[i:i+32]
-            try:
-                print(f"  - Processing embedding batch {i//32 + 1}...")
-                result = genai.embed_content(
-                    model='models/embedding-001',
-                    content=batch,
-                    task_type=task_type
-                )
-                all_embeddings.extend(result['embedding'])
-                # A small delay to be a good API citizen and avoid rate limits
-                time.sleep(0.5) 
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed on batch {i//32 + 1}: {e}")
-        
-        return np.array(all_embeddings).astype('float32')
+    # --- Indexing for Hybrid Search ---
+    def build_indices(self):
+        print("Step 1.3: Building indices for Hybrid Search...")
+        if not self.text_chunks:
+            return
 
-    def _build_faiss_index(self, embeddings: np.ndarray):
+        # Build Keyword Retriever (BM25)
+        self.keyword_retriever = BM25Retriever.from_texts(self.text_chunks)
+        self.keyword_retriever.k = 10 # Retrieve top 10
+        print("  - BM25 keyword retriever built.")
+
+        # Build Vector Index (FAISS)
+        all_embeddings = self._get_embeddings_batched(self.text_chunks, "RETRIEVAL_DOCUMENT")
         try:
             import faiss
-        except ImportError:
-            raise HTTPException(status_code=500, detail="FAISS library not found. Run 'pip install faiss-cpu'.")
-        
-        if embeddings.shape[0] == 0:
-            self.vector_store = None
-            return
-        
-        if embeddings.ndim == 1:
-            embeddings = np.expand_dims(embeddings, axis=0)
-            
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)
-        self.vector_store = index
+            if all_embeddings.ndim == 1:
+                all_embeddings = np.expand_dims(all_embeddings, axis=0)
+            index = faiss.IndexFlatL2(all_embeddings.shape[1])
+            index.add(all_embeddings)
+            self.vector_store = index
+            print("  - FAISS vector index built.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to build FAISS index: {e}")
 
-    def _search_faiss_index(self, query_embedding: np.ndarray, k: int = 5) -> List[str]:
-        if self.vector_store is None or self.vector_store.ntotal == 0:
-            return []
+    # --- NEW: Final RAG Steps ---
+
+    async def _step_1_fusion_retrieval(self, question: str) -> List[str]:
+        print(f"  - Step 1: Performing Fusion Retrieval for '{question[:40]}...'")
         
-        if query_embedding.ndim == 1:
-            query_embedding = np.expand_dims(query_embedding, axis=0)
+        # Keyword Search
+        keyword_docs = self.keyword_retriever.get_relevant_documents(question)
+        
+        # Vector Search
+        loop = asyncio.get_event_loop()
+        query_embedding = await loop.run_in_executor(None, self._get_embeddings_batched, [question], "RETRIEVAL_QUERY")
+        distances, indices = self.vector_store.search(query_embedding, k=10)
+        vector_docs = [Document(page_content=self.text_chunks[i]) for i in indices[0] if i < len(self.text_chunks)]
+        
+        # --- NEW: Reciprocal Rank Fusion (RRF) ---
+        fused_scores = {}
+        for i, doc in enumerate(keyword_docs):
+            if doc.page_content not in fused_scores:
+                fused_scores[doc.page_content] = 0
+            fused_scores[doc.page_content] += 1 / (i + 60) # k=60 is a standard constant
 
-        distances, indices = self.vector_store.search(query_embedding, k)
-        return [self.text_chunks[i] for i in indices[0] if i < len(self.text_chunks)]
+        for i, doc in enumerate(vector_docs):
+            if doc.page_content not in fused_scores:
+                fused_scores[doc.page_content] = 0
+            fused_scores[doc.page_content] += 1 / (i + 60)
 
-    def _ask_llm_with_context(self, question: str, context_chunks: List[str]) -> str:
+        reranked_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Get the top 8 unique documents from the fused results
+        final_docs = [Document(page_content=doc[0]) for doc in reranked_results[:8]]
+        print(f"    - Found and fused {len(final_docs)} unique candidates.")
+        
+        # --- NEW: Long Context Reorder ---
+        reordering = LongContextReorder()
+        reordered_docs = reordering.transform_documents(final_docs)
+        
+        return [doc.page_content for doc in reordered_docs]
+
+    async def _step_2_generate_final_answer(self, question: str, context_chunks: List[str]) -> str:
+        print(f"  - Step 2: Generating final answer with {len(context_chunks)} reordered context chunks...")
+        if not context_chunks:
+            return "I'm sorry, but I could not find any relevant information in the document to answer your question."
+
         context = "\n\n---\n\n".join(context_chunks)
         
         prompt = f"""
-        You are an expert insurance assistant. Your goal is to provide clear, helpful, and easy-to-understand answers based on the provided policy document excerpts.
+        You are an expert insurance analyst. You have been provided with several text chunks from a policy document that may be relevant to the user's question. Your task is to carefully analyze all of them and provide a definitive and accurate answer.
 
-        **Instructions:**
-        1.  **IMPORTANT:** Your final output must be clean, plain text. Do not use any special characters, Markdown, bullet points (*), bolding, or asterisks.
-        2.  Structure your answer in simple, easy-to-read paragraphs.
-        3.  Start with a direct summary sentence that immediately answers the user's core question.
-        4.  After the summary, explain the details in a helpful and friendly tone.
-        5.  If the information isn't in the provided context, politely state that and suggest the user check the full policy document.
-        6.  Rely ONLY on the information given in the context below. Do not use outside knowledge.
+        Follow these steps carefully (Chain-of-Thought):
+        1.  **Analyze Context:** First, internally read through all the provided text chunks and identify all the key facts, conditions, and exclusions that are directly relevant to the user's question. Discard any irrelevant information.
+        2.  **Reasoning:** Second, internally reason step-by-step how these facts combine to form a complete answer. Pay close attention to details, numbers, and specific conditions.
+        3.  **Final Answer:** Finally, synthesize your reasoning into a clear, helpful, and easy-to-understand final answer for the user.
+
+        **IMPORTANT INSTRUCTIONS:**
+        - Your final output must be **only the clean, plain-text final answer**. Do not show your internal reasoning steps.
+        - Do not use any special characters, Markdown, asterisks, or bullet points.
+        - Start with a direct summary sentence.
+        - Rely ONLY on the information given in the context. If the answer cannot be confidently determined from the context, politely state that.
 
         **CONTEXT:**
         {context}
-
         **QUESTION:**
         {question}
-
-        **CLEAN PLAIN-TEXT ANSWER:**
+        **CLEAN PLAIN-TEXT FINAL ANSWER:**
         """
         
-        try:
-            # Adding safety settings to prevent the model from refusing to answer
-            safety_settings = [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ]
-            response = self.generative_model.generate_content(prompt, safety_settings=safety_settings)
-            # Clean up any residual newlines or asterisks just in case
-            clean_text = response.text.strip().replace('*', '').replace('  ', ' ')
-            return clean_text
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to get answer from Gemini API: {e}")
+        max_retries = 3
+        delay = 2
+        for attempt in range(max_retries):
+            try:
+                response = await self.generative_model.generate_content_async(
+                    prompt, 
+                    safety_settings=self.safety_settings,
+                    generation_config=self.generation_config
+                )
+                clean_text = response.text.strip().replace('*', '').replace('  ', ' ')
+                return clean_text
+            except Exception as e:
+                if "429" in str(e) and attempt < max_retries - 1:
+                    print(f"    - Rate limit hit. Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                else:
+                    return f"An error occurred while generating the final answer: {e}"
+        return "The API is currently busy. Please try again later."
 
-    def process_query(self, pdf_url: str, questions: List[str]) -> List[str]:
-        print("Step 1: Downloading and extracting text...")
-        document_text = self._download_and_extract_text(pdf_url)
-        
-        print("Step 2: Splitting text into chunks...")
-        chunks = self._split_text_into_chunks(document_text)
-        if not chunks:
-            return ["Could not process the document or it is empty."] * len(questions)
-            
-        print("Step 3: Generating embeddings for document chunks...")
-        chunk_embeddings = self._get_embeddings(chunks, task_type="RETRIEVAL_DOCUMENT")
-        
-        print("Step 4: Building FAISS index...")
-        self._build_faiss_index(chunk_embeddings)
-        
-        answers = []
-        for i, question in enumerate(questions):
-            print(f"Step 5.{i+1}: Processing question: '{question}'")
-            # For a single question, batching isn't needed
-            query_embedding = self._get_embeddings([question], task_type="RETRIEVAL_QUERY")
-            context_chunks = self._search_faiss_index(query_embedding, k=5)
-            answer = self._ask_llm_with_context(question, context_chunks)
-            answers.append(answer)
-            print(f" -> Answer found: '{answer[:100]}...'")
+    # --- Main Orchestrator for a single question ---
+    async def process_single_question_async(self, question: str) -> str:
+        context = await self._step_1_fusion_retrieval(question)
+        final_answer = await self._step_2_generate_final_answer(question, context)
+        return final_answer
 
-        return answers
+    # --- Helper for embedding ---
+    def _get_embeddings_batched(self, texts: List[str], task_type: str) -> np.ndarray:
+        all_embeddings = []
+        for i in range(0, len(texts), 32):
+            batch = texts[i:i+32]
+            try:
+                result = genai.embed_content(model='models/embedding-001', content=batch, task_type=task_type)
+                all_embeddings.extend(result['embedding'])
+                time.sleep(0.2)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed on embedding batch {i//32 + 1}: {e}")
+        return np.array(all_embeddings).astype('float32')
 
 # --- 7. API Endpoint Definition ---
-
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def run_submission(
     query_request: QueryRequest,
@@ -227,8 +248,19 @@ async def run_submission(
         
     try:
         pipeline = RAGPipeline()
-        answers = pipeline.process_query(pdf_url=query_request.documents, questions=query_request.questions)
-        return {"answers": answers}
+        
+        pipeline.load_and_chunk_document(query_request.documents)
+        pipeline.build_indices()
+        
+        questions = query_request.questions
+        if not pipeline.vector_store or not pipeline.keyword_retriever:
+             return {"answers": ["Could not process the document or it is empty."] * len(questions)}
+
+        tasks = [pipeline.process_single_question_async(q) for q in questions]
+        answers = await asyncio.gather(*tasks)
+
+        return {"answers": list(answers)}
+
     except HTTPException as e:
         raise e
     except Exception as e:
@@ -237,4 +269,8 @@ async def run_submission(
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "HackRx 6.0 LLM API (Google Gemini) is running."}
+    return {"status": "ok", "message": "HackRx 6.0 Final RAG API is running."}
+
+# --- How to Run This Application ---
+# 1. Install necessary packages:
+#    pip install "fastapi[all]" uvicorn python-multipart requests PyMuPDF numpy "faiss-cpu" google-generativeai "rank-bm25" "langchain"
