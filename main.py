@@ -1,6 +1,6 @@
 # main.py
 # Complete FastAPI application for the HackRx 6.0 Challenge
-# VERSION 5.0: Production-Grade RAG with Hybrid Search and LLM Re-ranking for Maximum Accuracy.
+# VERSION 12.0: Final version with API Key Rotation to solve the RPM limit without queuing.
 
 # --- 1. Imports ---
 import os
@@ -13,39 +13,45 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import List, Dict
+from itertools import cycle # Added for API key rotation
 from fastapi.middleware.cors import CORSMiddleware
-
 
 # --- Imports for Google Gemini ---
 import google.generativeai as genai
 
-# --- NEW: Import for Keyword Search ---
-from rank_bm25 import BM25Okapi
-
 # --- Imports for LangChain and Keyword Search ---
 from rank_bm25 import BM25Okapi
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.retrievers.document_compressors import DocumentCompressorPipeline
-from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import BM25Retriever
 from langchain.schema import Document
 from langchain_community.document_transformers import LongContextReorder
 
 # --- 2. Configuration & API Keys ---
 
 AUTH_TOKEN = os.environ.get("HACKRX_AUTH_TOKEN", "b7be0d0c6cb51a6c84e190a66d4542526361d32d3df9035b4c8a00b9198df385")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyAaaQ1eLAGq3VckCBBF4YCLKaIxWPVZnSg")
 
-if not GOOGLE_API_KEY or GOOGLE_API_KEY == "YOUR_GOOGLE_API_KEY_HERE":
-    print("WARNING: GOOGLE_API_KEY is not set. The application will not work.")
+# --- NEW: List of API Keys for Rotation ---
+# Add your API keys to this list. It will cycle through them for each request.
+GOOGLE_API_KEYS = [
+    os.environ.get("GOOGLE_API_KEY_1", "AIzaSyAaaQ1eLAGq3VckCBBF4YCLKaIxWPVZnSg"),
+    os.environ.get("GOOGLE_API_KEY_2", "YOUR_GOOGLE_API_KEY_2_HERE"),
+    os.environ.get("GOOGLE_API_KEY_3", "YOUR_GOOGLE_API_KEY_3_HERE"),
+]
+
+# Filter out placeholder keys
+GOOGLE_API_KEYS = [key for key in GOOGLE_API_KEYS if "HERE" not in key]
+
+if not GOOGLE_API_KEYS:
+    print("WARNING: No GOOGLE_API_KEYs are set. The application will not work.")
 else:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    print("Google Gemini API configured.")
+    print(f"Found {len(GOOGLE_API_KEYS)} API keys for rotation.")
+
 
 # --- 3. FastAPI App Initialization ---
 app = FastAPI(
-    title="HackRx 6.0 Production-Grade RAG System",
-    description="An API using Hybrid Search and LLM Re-ranking for maximum accuracy.",
-    version="5.0.0"
+    title="HackRx 6.0 Final RAG System",
+    description="An API using an Advanced Fusion Retriever with API Key Rotation for maximum speed and throughput.",
+    version="12.0.0"
 )
 
 # CORS Middleware for local development
@@ -75,17 +81,25 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 # --- 6. Core RAG Pipeline Components ---
 
 class RAGPipeline:
-    def __init__(self):
+    def __init__(self, api_key_pool: List[str]):
         self.text_chunks = []
         self.vector_store = None
         self.keyword_retriever = None
-        self.generative_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        self.generation_config = genai.types.GenerationConfig(max_output_tokens=500, temperature=0.0)
-        self.safety_settings = [
-            {"category": c, "threshold": "BLOCK_NONE"} for c in 
-            ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", 
-             "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]
+        
+        # --- NEW: Create a pool of generative models, one for each API key ---
+        self.model_pool = [
+            genai.GenerativeModel('gemini-1.5-flash-latest', safety_settings=[
+                {"category": c, "threshold": "BLOCK_NONE"} for c in 
+                ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", 
+                 "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]
+            ])
+            for _ in api_key_pool
         ]
+        self.api_key_cycler = cycle(api_key_pool)
+        self.model_cycler = cycle(self.model_pool)
+
+        self.generation_config = genai.types.GenerationConfig(max_output_tokens=500, temperature=0.0)
+        
 
     # --- Document Loading and Chunking ---
     def load_and_chunk_document(self, pdf_url: str):
@@ -114,12 +128,12 @@ class RAGPipeline:
         if not self.text_chunks:
             return
 
-        # Build Keyword Retriever (BM25)
         self.keyword_retriever = BM25Retriever.from_texts(self.text_chunks)
-        self.keyword_retriever.k = 10 # Retrieve top 10
+        self.keyword_retriever.k = 10
         print("  - BM25 keyword retriever built.")
 
-        # Build Vector Index (FAISS)
+        # Use the first API key for the initial embedding process
+        genai.configure(api_key=next(self.api_key_cycler))
         all_embeddings = self._get_embeddings_batched(self.text_chunks, "RETRIEVAL_DOCUMENT")
         try:
             import faiss
@@ -132,46 +146,40 @@ class RAGPipeline:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to build FAISS index: {e}")
 
-    # --- NEW: Final RAG Steps ---
+    # --- Final RAG Steps ---
 
-    async def _step_1_fusion_retrieval(self, question: str) -> List[str]:
+    async def _step_1_fusion_retrieval(self, question: str, api_key: str) -> List[str]:
         print(f"  - Step 1: Performing Fusion Retrieval for '{question[:40]}...'")
+        genai.configure(api_key=api_key) # Ensure correct key is used for this thread
         
-        # Keyword Search
         keyword_docs = self.keyword_retriever.get_relevant_documents(question)
         
-        # Vector Search
         loop = asyncio.get_event_loop()
         query_embedding = await loop.run_in_executor(None, self._get_embeddings_batched, [question], "RETRIEVAL_QUERY")
         distances, indices = self.vector_store.search(query_embedding, k=10)
         vector_docs = [Document(page_content=self.text_chunks[i]) for i in indices[0] if i < len(self.text_chunks)]
         
-        # --- NEW: Reciprocal Rank Fusion (RRF) ---
         fused_scores = {}
         for i, doc in enumerate(keyword_docs):
-            if doc.page_content not in fused_scores:
-                fused_scores[doc.page_content] = 0
-            fused_scores[doc.page_content] += 1 / (i + 60) # k=60 is a standard constant
+            fused_scores.setdefault(doc.page_content, 0)
+            fused_scores[doc.page_content] += 1 / (i + 60)
 
         for i, doc in enumerate(vector_docs):
-            if doc.page_content not in fused_scores:
-                fused_scores[doc.page_content] = 0
+            fused_scores.setdefault(doc.page_content, 0)
             fused_scores[doc.page_content] += 1 / (i + 60)
 
         reranked_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
         
-        # Get the top 8 unique documents from the fused results
         final_docs = [Document(page_content=doc[0]) for doc in reranked_results[:8]]
         print(f"    - Found and fused {len(final_docs)} unique candidates.")
         
-        # --- NEW: Long Context Reorder ---
         reordering = LongContextReorder()
         reordered_docs = reordering.transform_documents(final_docs)
         
         return [doc.page_content for doc in reordered_docs]
 
-    async def _step_2_generate_final_answer(self, question: str, context_chunks: List[str]) -> str:
-        print(f"  - Step 2: Generating final answer with {len(context_chunks)} reordered context chunks...")
+    async def _step_2_generate_final_answer(self, question: str, context_chunks: List[str], model: genai.GenerativeModel) -> str:
+        print(f"  - Step 2: Generating final answer for '{question[:40]}...'")
         if not context_chunks:
             return "I'm sorry, but I could not find any relevant information in the document to answer your question."
 
@@ -198,31 +206,30 @@ class RAGPipeline:
         **CLEAN PLAIN-TEXT FINAL ANSWER:**
         """
         
-        max_retries = 3
-        delay = 2
-        for attempt in range(max_retries):
-            try:
-                response = await self.generative_model.generate_content_async(
-                    prompt, 
-                    safety_settings=self.safety_settings,
-                    generation_config=self.generation_config
-                )
-                clean_text = response.text.strip().replace('*', '').replace('  ', ' ')
-                return clean_text
-            except Exception as e:
-                if "429" in str(e) and attempt < max_retries - 1:
-                    print(f"    - Rate limit hit. Retrying in {delay} seconds...")
-                    await asyncio.sleep(delay)
-                    delay *= 2
-                else:
-                    return f"An error occurred while generating the final answer: {e}"
-        return "The API is currently busy. Please try again later."
+        response = await model.generate_content_async(
+            prompt, 
+            generation_config=self.generation_config
+        )
+        clean_text = response.text.strip().replace('*', '').replace('  ', ' ')
+        return clean_text
 
     # --- Main Orchestrator for a single question ---
     async def process_single_question_async(self, question: str) -> str:
-        context = await self._step_1_fusion_retrieval(question)
-        final_answer = await self._step_2_generate_final_answer(question, context)
-        return final_answer
+        # --- NEW: Get the next key and model from the cycler for this specific question ---
+        api_key = next(self.api_key_cycler)
+        model = next(self.model_cycler)
+        
+        try:
+            context = await self._step_1_fusion_retrieval(question, api_key)
+            final_answer = await self._step_2_generate_final_answer(question, context, model)
+            return final_answer
+        except Exception as e:
+            print(f"An error occurred processing question '{question[:40]}...': {e}")
+            # Check for rate limit error specifically
+            if "429" in str(e):
+                return f"API rate limit exceeded for one of the keys while processing this question. Please try again shortly."
+            return f"An error occurred while processing the question: {question}"
+
 
     # --- Helper for embedding ---
     def _get_embeddings_batched(self, texts: List[str], task_type: str) -> np.ndarray:
@@ -243,11 +250,11 @@ async def run_submission(
     query_request: QueryRequest,
     token: str = Depends(get_current_user)
 ):
-    if not GOOGLE_API_KEY or GOOGLE_API_KEY == "YOUR_GOOGLE_API_KEY_HERE":
-        raise HTTPException(status_code=500, detail="Google API key is not configured on the server.")
+    if not GOOGLE_API_KEYS:
+        raise HTTPException(status_code=500, detail="No Google API keys are configured on the server.")
         
     try:
-        pipeline = RAGPipeline()
+        pipeline = RAGPipeline(api_key_pool=GOOGLE_API_KEYS)
         
         pipeline.load_and_chunk_document(query_request.documents)
         pipeline.build_indices()
@@ -273,4 +280,9 @@ def read_root():
 
 # --- How to Run This Application ---
 # 1. Install necessary packages:
-#    pip install "fastapi[all]" uvicorn python-multipart requests PyMuPDF numpy "faiss-cpu" google-generativeai "rank-bm25" "langchain"
+#    pip install "fastapi[all]" uvicorn python-multipart requests PyMuPDF numpy "faiss-cpu" google-generativeai "rank-bm25" "langchain" "langchain-community"
+#
+# 2. Add your API keys to the `GOOGLE_API_KEYS` list in this script, or set them as environment variables:
+#    export GOOGLE_API_KEY_1="key-1..."
+#    export GOOGLE_API_KEY_2="key-2..."
+#    export GOOGLE_API_KEY_3="key-3..."
